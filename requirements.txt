@@ -1,0 +1,10 @@
+streamlit
+streamlit-mic-recorder
+streamlit-lottie
+requests
+openpyxl
+google-cloud-storage
+google-cloud-speech
+google-cloud-firestore
+google-auth
+google-cloud-aiplatform
