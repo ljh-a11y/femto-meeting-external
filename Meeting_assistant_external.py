@@ -1,19 +1,13 @@
 import streamlit as st
 from streamlit_mic_recorder import mic_recorder
-from streamlit_lottie import st_lottie
 import datetime
 import time
-import requests
 import warnings
-import urllib.parse
 import os
 import openpyxl
 from openpyxl.styles import Alignment
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+import requests
+from google_auth_oauthlib.flow import Flow
 from google.cloud import storage, speech, firestore
 import google.auth
 import vertexai
@@ -25,70 +19,138 @@ warnings.filterwarnings("ignore")
 PROJECT_ID = "femto-ai-assistant-497500"
 LOCATION = "asia-northeast3"
 BUCKET_NAME = "femto-meeting-luke"
-TEMPLATE_FILE = "ai 회의록.xlsx"  # 엑셀 템플릿 파일명
-EXTERNAL_DB_NAME = "external-meetings"  # 외부 전용 파이어스토어 DB 명칭
+TEMPLATE_FILE = "ai 회의록.xlsx"
+EXTERNAL_DB_NAME = "external-meetings"
 
 my_options = {"quota_project_id": PROJECT_ID}
 
 # ========================================================
-# [구글 인증] 파이참 터미널 로그인 정보(gcloud)와 연동
+# 🔑 [Streamlit Secrets 보안 키 연동]
+# ========================================================
+CLIENT_ID = st.secrets["CLIENT_ID"]
+CLIENT_SECRET = st.secrets["CLIENT_SECRET"]
+REDIRECT_URI = st.secrets["REDIRECT_URI"]
+
+
+# 구글 OAuth 인증 플로우 생성 함수
+def get_google_oauth_flow():
+    client_config = {
+        "web": {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [REDIRECT_URI]
+        }
+    }
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=[
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile"
+        ],
+        redirect_uri=REDIRECT_URI
+    )
+    flow.autogenerate_code_verifier = False
+    return flow
+
+
+# ========================================================
+# [구글 클라우드 백엔드 인증]
 # ========================================================
 try:
     creds, _ = google.auth.default(quota_project_id=PROJECT_ID)
     vertexai.init(project=PROJECT_ID, location=LOCATION, credentials=creds)
 except Exception as e:
-    st.error(f" 구글 인증서 로드 실패: {e}")
-    st.info(" 해결 방법: 파이참 하단 [Terminal] 탭에서 'gcloud auth application-default login' 명령어를 입력해 로그인을 완료해 주세요.")
+    st.error(f"구글 클라우드 인증서 로드 실패: {e}")
 
-# --- 프리미엄 디자인 ---
+# --- 페이지 디자인 ---
 st.set_page_config(page_title="Femto AI Dash (External)", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
     <style>
     .stApp { background-color: #F8FAFC; color: #0F172A; }
-    .stat-card {
-        background: #FFFFFF; padding: 24px; border-radius: 20px; border: 1px solid #E2E8F0;
-        text-align: center; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-    }
-    .stat-val { color: #2563EB; font-size: 1.8rem; font-weight: 800; }
-    .stat-lbl { color: #64748B; font-size: 0.9rem; font-weight: 600; }
-    .live-monitor {
-        background-color: #FFFFFF; color: #334155; padding: 25px; border-radius: 16px;
-        font-family: 'Consolas', monospace; font-size: 1.1rem; line-height: 1.8;
-        height: 300px; overflow-y: auto; border: 1px solid #CBD5E1;
+
+    iframe[title="streamlit_mic_recorder.mic_recorder"] {
+        width: 100% !important;
     }
     </style>
 """, unsafe_allow_html=True)
 
+# ========================================================
+# 🔑 [사이드바 구글 로그인 & DB 권한 자동 조회]
+# ========================================================
+st.sidebar.title("🔑 사내 구글 인증")
 
-# --- 이메일 발송 함수 ---
-def send_email_with_excel(to_email, file_path, subject, body_text):
-    SMTP_SERVER = "smtp.naver.com"
-    SMTP_PORT = 465
-    SENDER_EMAIL = "내이메일@naver.com"
-    SENDER_PASSWORD = "내보안앱비밀번호"
+if "user_email" not in st.session_state:
+    st.session_state.user_email = ""
+    st.session_state.user_name = ""
+    st.session_state.user_level = 0
 
+query_params = st.query_params
+if "code" in query_params and not st.session_state.user_email:
+    auth_code = query_params["code"]
     try:
-        msg = MIMEMultipart()
-        msg['From'] = SENDER_EMAIL
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body_text, 'plain'))
+        flow = get_google_oauth_flow()
+        flow.fetch_token(code=auth_code)
+        credentials = flow.credentials
 
-        with open(file_path, "rb") as attachment:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(attachment.read())
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(file_path)}")
-            msg.attach(part)
+        user_info_response = requests.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {credentials.token}"}
+        )
+        if user_info_response.status_code == 200:
+            google_user = user_info_response.json()
+            google_email = google_user.get("email", "").strip().lower()
 
-        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-        server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.sendmail(SENDER_EMAIL, to_email, msg.as_string())
-        server.quit()
-        return True
-    except Exception as e:
-        st.error(f"이메일 발송 실패: {e}")
-        return False
+            db_fs = firestore.Client(project=PROJECT_ID, database=EXTERNAL_DB_NAME, client_options=my_options)
+            user_doc = db_fs.collection("users").document(google_email).get()
+
+            if user_doc.exists:
+                user_data = user_doc.to_dict()
+                if user_data.get("is_active", False):
+                    st.session_state.user_email = google_email
+                    st.session_state.user_name = user_data.get("name", google_user.get("name", "직원"))
+                    st.session_state.user_level = int(user_data.get("level", 1))
+                    st.query_params.clear()
+                    st.rerun()
+                else:
+                    st.sidebar.error("❌ 비활성화된 계정입니다.")
+            else:
+                st.sidebar.error(f"❌ DB에 미등록된 사내 이메일입니다: {google_email}")
+    except Exception as err:
+        st.sidebar.error(f"구글 인증 연동 실패: {err}")
+
+if not st.session_state.user_email:
+    st.sidebar.info("사내 구글 계정으로 로그인해 주세요.")
+    flow = get_google_oauth_flow()
+    auth_url, _ = flow.authorization_url(prompt='consent')
+
+    st.sidebar.markdown(
+        f'''
+        <a href="{auth_url}" target="_self" style="text-decoration:none;">
+            <div style="background-color: #4285F4; color: white; padding: 12px; border-radius: 8px; text-align: center; font-weight: bold; font-size: 15px;">
+                🌐 Google 계정으로 로그인
+            </div>
+        </a>
+        ''',
+        unsafe_allow_html=True
+    )
+
+if st.session_state.user_email:
+    st.sidebar.success("✅ 구글 인증 완료")
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(f"👤 **접속자:** {st.session_state.user_name}")
+    st.sidebar.markdown(f"✉️ **이메일:** {st.session_state.user_email}")
+    st.sidebar.markdown(f"🛡️ **권한 등급:** Level {st.session_state.user_level}")
+    st.sidebar.markdown("---")
+
+    if st.sidebar.button("로그아웃", use_container_width=True):
+        st.session_state.user_email = ""
+        st.session_state.user_name = ""
+        st.session_state.user_level = 0
+        st.query_params.clear()
+        st.rerun()
 
 
 # --- GCS 파일 가져오기 ---
@@ -98,7 +160,7 @@ def list_gcs_files():
         blobs = list(client_s.list_blobs(BUCKET_NAME))
         return sorted([blob.name for blob in blobs if blob.name.endswith('.wav')], reverse=True)
     except Exception as e:
-        st.error(f" 구글 스토리지 연결 실패: {e}")
+        st.error(f"구글 스토리지 연결 실패: {e}")
         return []
 
 
@@ -159,24 +221,10 @@ def speech_to_text(audio_data, lang_code, gcs_uri=None, selected_filename=None):
         return ""
 
 
-# --- 2단계: Gemini 2.5 압축 및 과거 이력 지속 학습 엔진 ---
+# --- 2단계: Gemini 2.5 압축 엔진 ---
 def generate_report_text_only(text_content):
     try:
         model = GenerativeModel("gemini-2.5-flash")
-
-        history_context = ""
-        try:
-            # 외부 전용 데이터베이스(external-meetings)를 참조하도록 구성
-            db_fs = firestore.Client(project=PROJECT_ID, database=EXTERNAL_DB_NAME, client_options=my_options)
-            past_docs = list(
-                db_fs.collection("meetings").order_by("date", direction=firestore.Query.DESCENDING).limit(3).stream())
-            if past_docs:
-                history_context = "\n[사전 학습 데이터 - 과거 회의 기록의 요약 서식 및 단어 패턴 참고]\n"
-                for doc in past_docs:
-                    d = doc.to_dict()
-                    history_context += f"- 과거 안건: {d.get('title', '')} / 요약 스타일: {d.get('ai_summary', '')[:100]}...\n"
-        except:
-            pass
 
         prompt = f"""당신은 '펨토사이언스'의 전문 비서 AI입니다.
         제공된 회의 스크립트를 바탕으로 가시성이 뛰어난 고품질 핵심 회의록 리포트를 작성하세요.
@@ -187,11 +235,9 @@ def generate_report_text_only(text_content):
         3. 다른 말 없이 무조건 본론 대괄호 헤더부터 즉시 시작하세요.
 
         [작성 형식]
-        - 내용을 더 넓은 범위로 크게 묶어서 최대 4~5개의 [대괄호 주제]로만 분류하세요. (예: [영업 마케팅 및 전략 강화를 위한 지시사항], [핵심 개발 과제 및 표준화 추진 현황] 등)
+        - 내용을 더 넓은 범위로 크게 묶어서 최대 4~5개의 [대괄호 주제]로만 분류하세요.
         - 정중하고 깔끔한 비즈니스 개조식 어투(~할 것, ~ 요망, ~ 완료 바람)를 사용하세요.
         - 모든 세부 항목은 개별 줄마다 '• ' 기호로 시작하세요.
-
-        {history_context}
 
         내용: {text_content}"""
 
@@ -202,7 +248,7 @@ def generate_report_text_only(text_content):
         return ""
 
 
-# --- 3단계: 엑셀 정밀 틀 고정 데이터 기입 엔진 ---
+# --- 3단계: 엑셀 데이터 기입 엔진 ---
 def save_final_summary_to_excel(final_summary, meta_info):
     try:
         if os.path.exists(TEMPLATE_FILE):
@@ -221,7 +267,6 @@ def save_final_summary_to_excel(final_summary, meta_info):
                     target_cell.alignment = alignment
                 return target_cell
 
-            # 메타 정보 입력 구역 연동 (6행~9행)
             safe_write('B6', meta_info['일시'])
             safe_write('E6', meta_info['부서'])
             safe_write('B7', meta_info['주관'])
@@ -229,10 +274,10 @@ def save_final_summary_to_excel(final_summary, meta_info):
             safe_write('B8', meta_info['참석자'])
             safe_write('B9', meta_info['안건'])
 
-            p1_rows = list(range(10, 29))  # 1페이지 본문 (10~28행)
-            p2_rows = list(range(32, 59))  # 2페이지 본문 (32~58행)
-            p3_rows = list(range(62, 89))  # 3페이지 본문 (62~88행)
-            p4_rows = list(range(92, 119)) # 4페이지 본문 (92~118행)
+            p1_rows = list(range(10, 29))
+            p2_rows = list(range(32, 59))
+            p3_rows = list(range(62, 89))
+            p4_rows = list(range(92, 119))
 
             paragraphs = []
             current_block = []
@@ -278,10 +323,7 @@ def save_final_summary_to_excel(final_summary, meta_info):
                 paragraphs.append(current_block)
 
             final_mapped_lines = []
-            p1_idx = 0
-            p2_idx = 0
-            p3_idx = 0
-            p4_idx = 0
+            p1_idx = p2_idx = p3_idx = p4_idx = 0
             current_page = 1
 
             for idx_p, block in enumerate(paragraphs):
@@ -438,46 +480,31 @@ with tab1:
     with col_meta:
         st.subheader("📋 회의 기본 정보 입력")
 
-        # 1. 부서 하이브리드 입력
         dept_options = ["통합사업팀 (IBD Team)", "개발혁신팀", "직접입력"]
         selected_dept = st.selectbox("부서 선택", dept_options, index=0)
-        if selected_dept == "직접입력":
-            m_dept = st.text_input("부서명 수기 입력", placeholder="부서명을 직접 입력하세요")
-        else:
-            m_dept = selected_dept
+        m_dept = st.text_input("부서명 수기 입력", placeholder="부서명을 직접 입력하세요") if selected_dept == "직접입력" else selected_dept
 
-        # 2. 작성자 하이브리드 입력
         author_options = [
             "이주혁 프로", "박홍근 프로", "조이정 대리", "김다다 팀장",
             "윤진성 프로", "조인오 프로", "김준민 팀장", "김무환 대표",
             "김대현 고문", "류재홍 박사", "직접입력"
         ]
         selected_author = st.selectbox("작성자 선택", author_options, index=0)
-        if selected_author == "직접입력":
-            m_writer = st.text_input("작성자 수기 입력", placeholder="이름 및 직급을 입력하세요")
-        else:
-            m_writer = selected_author
+        m_writer = st.text_input("작성자 수기 입력",
+                                 placeholder="이름 및 직급을 입력하세요") if selected_author == "직접입력" else selected_author
 
-        # 3. 주관
         m_host = st.text_input("주관 (발표자/회의 리더)", "이주혁")
 
-        # 4. 참석자 하이브리드 입력
         attendee_options = ["전직원(대표님 포함)", "통합사업팀", "개발혁신팀", "수기입력"]
         selected_attendees = st.selectbox("참석자 범위 선택", attendee_options, index=0)
-        if selected_attendees == "수기입력":
-            m_attendees = st.text_input("참석자 명단 수기 입력", placeholder="참석자 명단을 입력하세요")
-        else:
-            m_attendees = selected_attendees
+        m_attendees = st.text_input("참석자 명단 수기 입력",
+                                    placeholder="참석자 명단을 입력하세요") if selected_attendees == "수기입력" else selected_attendees
 
-        # 5. 안건 하이브리드 입력
         topic_options = [f"정기 업무 보고_{datetime.date.today()}", "월발회의", "팀장회의", "팀 회의", "수기입력"]
         selected_topic = st.selectbox("안건 종류 선택", topic_options, index=0)
-        if selected_topic == "수기입력":
-            m_title = st.text_input("안건 수기 입력", placeholder="회의 제목이나 안건을 입력하세요")
-        else:
-            m_title = selected_topic
+        m_title = st.text_input("안건 수기 입력",
+                                placeholder="회의 제목이나 안건을 입력하세요") if selected_topic == "수기입력" else selected_topic
 
-        # 6. 일시 자동 바인딩
         m_date = st.text_input("일시", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
 
         meta_data = {"부서": m_dept, "작성자": m_writer, "주관": m_host, "참석자": m_attendees, "안건": m_title, "일시": m_date}
@@ -487,12 +514,12 @@ with tab1:
         security_level = st.select_slider(
             "회의 보안 등급 설정",
             options=["Level 1 (Public)", "Level 2 (Internal)", "Level 3 (Secret)"],
-            help="외부 전용 계층 모델 및 보안 정책을 적용합니다."
+            help="설정된 보안 레벨에 따라 해당 등급 이상의 권한을 가진 사용자만 열람할 수 있습니다."
         )
         st.write(f"🔒 활성화된 보안 상태: **{security_level}**")
         st.divider()
 
-        st.subheader("🎙️ 오디오 제어 / 변환 모듈")
+        st.subheader("🎙️ 오디오 제어 / 회의록 생성 모듈")
         input_mode = st.radio("작업 방식 선택", ["실시간 녹음", "기존 파일 선택", "📝 회의록 텍스트 직접 입력"])
 
         if "is_recording" not in st.session_state:
@@ -500,66 +527,40 @@ with tab1:
         if "is_converting" not in st.session_state:
             st.session_state.is_converting = False
 
-        c_box1, c_box2 = st.columns(2)
-
         if input_mode == "실시간 녹음":
-            with c_box1:
-                if st.session_state.is_recording:
-                    st.markdown("""
-                        <div style='text-align: center; padding: 20px; border: 2px solid #ef4444; border-radius: 16px; background-color: #fef2f2; margin-bottom:10px;'>
-                            <span style='color: #ef4444; font-size: 20px; font-weight: 800; animation: blink 1s infinite;'>🔴 라이브 녹음 중</span>
-                            <div style='font-size: 36px; margin: 8px 0; color: #f87171; letter-spacing:2px;'>∿∿〰〰∿∿</div>
-                        </div>
-                        <style>
-                            @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
-                        </style>
-                    """, unsafe_allow_html=True)
-                else:
-                    st.markdown("""
-                        <div style='text-align: center; padding: 24px; border: 1px solid #cbd5e1; border-radius: 16px; background-color: #f8fafc; color: #64748b; margin-bottom:10px;'>
-                            <span style='font-size: 15px; font-weight:600;'>하단 마이크 버튼 대기 중</span>
-                            <div style='font-size: 32px; margin: 8px 0;'>🎙️</div>
-                        </div>
-                    """, unsafe_allow_html=True)
+            st.markdown("""
+                <div style='background-color: #EFF6FF; border: 1px solid #BFDBFE; padding: 14px 18px; border-radius: 12px; margin-bottom: 12px;'>
+                    <span style='font-size: 14px; font-weight: 700; color: #1E40AF;'>🎙️ 실시간 음성 녹음 안내</span><br>
+                    <span style='font-size: 12px; color: #475569;'>아래 <b>[🔴 실시간 녹음 시작]</b> 버튼을 누르면 마이크가 켜집니다. 회의 종료 후 한 번 더 누르면 AI 회의록이 생성됩니다.</span>
+                </div>
+            """, unsafe_allow_html=True)
 
-                audio_record = mic_recorder(start_prompt="▶️ 녹음 시작", stop_prompt="⏹️ 녹음 완료 및 자막 변환", key='rec')
+            audio_record = mic_recorder(
+                start_prompt="🔴 실시간 녹음 시작 (마이크 활성화)",
+                stop_prompt="⏹️ 녹음 완료 및 AI 회의록 즉시 생성",
+                key='rec'
+            )
 
-                if audio_record:
-                    st.session_state.is_recording = False
-                    st.session_state.is_converting = True
-                    st.session_state.transcript = speech_to_text(audio_record['bytes'], "ko-KR")
-                    st.session_state.is_converting = False
-                    st.rerun()
+            if st.session_state.is_converting:
+                with st.status("🔮 AI 음성 분석 및 회의록 생성 중...", expanded=True) as status:
+                    st.write("1️⃣ 오디오 데이터 수신 완료")
+                    time.sleep(0.8)
+                    st.write("2️⃣ 구글 STT 자막 변환 처리 중...")
+                    time.sleep(0.8)
+                    status.update(label="✅ 회의록 생성 완료!", state="complete", expanded=False)
 
-            with c_box2:
-                if st.session_state.is_converting:
-                    st.markdown("<div style='padding: 2px;'>", unsafe_allow_html=True)
-                    with st.status("🔮 인공지능 엔드포인트 연동 중...", expanded=True) as status:
-                        st.write("1️⃣ 오디오 청크 스트리밍 수신 완료...")
-                        time.sleep(1.2)
-                        st.write("2️⃣ 구글 STT 핵심 주관어 결합 처리 중...")
-                        time.sleep(1.2)
-                        st.write("3️⃣ 백엔드 텍스트 렌더링 파이프라인 정렬 중...")
-                        time.sleep(0.8)
-                        status.update(label="✅ 분석 및 전송 성공!", state="complete", expanded=False)
-
-                    p_bar = st.progress(0)
-                    for p in range(100):
-                        time.sleep(0.005)
-                        p_bar.progress(p + 1)
-                else:
-                    st.markdown("""
-                        <div style='text-align: center; padding: 24px; border: 1px solid #cbd5e1; border-radius: 16px; background-color: #f8fafc; color: #64748b; height: 112px;'>
-                            <span style='font-size: 15px; font-weight:600;'>변환 파이프라인 대기</span>
-                            <div style='font-size: 32px; margin: 4px 0;'>✨</div>
-                        </div>
-                    """, unsafe_allow_html=True)
+            if audio_record:
+                st.session_state.is_recording = False
+                st.session_state.is_converting = True
+                st.session_state.transcript = speech_to_text(audio_record['bytes'], "ko-KR")
+                st.session_state.is_converting = False
+                st.rerun()
 
         elif input_mode == "기존 파일 선택":
             gcs_files = list_gcs_files()
             if gcs_files:
                 selected_file = st.selectbox("클라우드 오디오 파일 선택", gcs_files)
-                if st.button("🚀 선택 파일 자막 변환 시작", type="primary", use_container_width=True):
+                if st.button("🚀 선택 파일 AI 회의록 생성 시작", type="primary", use_container_width=True):
                     st.session_state.is_converting = True
                     gcs_uri = f"gs://{BUCKET_NAME}/{selected_file}"
                     st.session_state.transcript = speech_to_text(None, "ko-KR", gcs_uri=gcs_uri,
@@ -567,25 +568,11 @@ with tab1:
                     st.session_state.is_converting = False
                     st.rerun()
             else:
-                st.warning(" 구글 스토리지에서 오디오(.wav) 목록을 불러오지 못했거나 파일이 없습니다.")
+                st.warning("구글 스토리지에서 오디오(.wav) 목록을 불러오지 못했거나 파일이 없습니다.")
 
         elif input_mode == "📝 회의록 텍스트 직접 입력":
-            st.info("💡 녹음이나 AI 요약을 패스하고, 아래 텍스트 창에 입력한 대로 엑셀 양식이 어떻게 생성되는지 즉시 테스트합니다.")
-
-            sample_init_value = (
-                "[영업 및 마케팅 전략 강화]\n"
-                "신규 장착 기능 및 개선 사항을 강조하되, 가격은 동결하여 경쟁력 확보 요망.\n"
-                "제품의 강점과 가치를 명확히 전달하여 고객 구매를 유도하는 적극적인 영업 방식 필요.\n"
-                "제품 사양서 및 견적서를 상세하고 체계적으로 작성하여 고객 문의에 즉각 대응할 준비 완료 요망.\n"
-                "경쟁사 제품(예: 펌프) 사양 및 기능을 숙지하여 시장 대응 능력 강화.\n"
-                "[3대 과제 표준화 추진 현황]\n"
-                "ICP 표준화: 6월 말까지 완료 목표.\n"
-                "PCVD 표준화: 일본 대상 발표자 지정 및 발표 자료 준비 철저.\n"
-                "HLS 및 MRPG: 6월 첫째 주에 주역, 경력 담당으로 일정 확정 및 추진.\n"
-                "표준화된 절차 및 내용을 사내 전체에 빠르게 적용할 것."
-            )
-
-            sandbox_text = st.text_area("엑셀 반영 테스트용 내용 입력", value=sample_init_value, height=200)
+            st.info("💡 텍스트 입력 후 엑셀 양식 단독 빌드 테스트를 수행합니다.")
+            sandbox_text = st.text_area("엑셀 반영 테스트용 내용 입력", height=200)
 
             if st.button("📊 테스트 엑셀 문서 즉시 빌드", type="primary", use_container_width=True):
                 st.session_state.ai_summary = sandbox_text
@@ -595,10 +582,9 @@ with tab1:
                     if excel_path:
                         st.session_state.excel_path = excel_path
 
-    # --- 공통 리포팅 엔진 렌더링 구역 ---
     if input_mode != "📝 회의록 텍스트 직접 입력" and 'transcript' in st.session_state:
         st.divider()
-        st.subheader("📝 1차 음성 인식 결과 (필요시 오타를 수정하세요)")
+        st.subheader("📝 1차 음성 인식 결과")
         edited_text = st.text_area("인식된 대화 내용 (STT)", value=st.session_state.transcript, height=220)
 
         if st.button("✨ 1차 AI 요약 리포트 초안 생성", type="secondary", use_container_width=True):
@@ -612,7 +598,7 @@ with tab1:
 
     if input_mode != "📝 회의록 텍스트 직접 입력" and 'ai_summary' in st.session_state:
         st.divider()
-        st.subheader("🤖 AI 최종 요약 리포트 검토 (엑셀 삽입 전 편집 가능)")
+        st.subheader("🤖 AI 최종 요약 리포트 검토")
         edited_summary = st.text_area("엑셀에 반영될 요약 내용 편집", value=st.session_state.ai_summary, height=300)
 
         if st.button("📊 이 내용으로 최종 엑셀 문서 빌드", type="primary", use_container_width=True):
@@ -623,7 +609,6 @@ with tab1:
                     st.session_state.excel_path = excel_path
 
                     try:
-                        # 외부 전용 파이어스토어 DB 명칭(external-meetings) 적용
                         db = firestore.Client(project=PROJECT_ID, database=EXTERNAL_DB_NAME, client_options=my_options)
                         db.collection("meetings").add({
                             "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -631,6 +616,7 @@ with tab1:
                             "host": meta_data['주관'],
                             "dept": meta_data['부서'],
                             "writer": meta_data['작성자'],
+                            "writer_email": st.session_state.user_email,
                             "attendees": meta_data['참석자'],
                             "transcript": st.session_state.transcript,
                             "ai_summary": st.session_state.ai_summary,
@@ -638,7 +624,7 @@ with tab1:
                         })
                         st.toast("🔥 외부 전용 클라우드 DB에 회의록 기록이 백업되었습니다!")
                     except Exception as db_err:
-                        st.warning(f"DB 백업 중 권한 오류 발생 (로컬 엑셀 파일은 정상 빌드됨): {db_err}")
+                        st.warning(f"DB 백업 중 권한 오류 발생: {db_err}")
 
     if 'excel_path' in st.session_state:
         st.divider()
@@ -653,57 +639,64 @@ with tab1:
                 use_container_width=True
             )
 
-        st.write("")
-        st.markdown("### 📧 부서원에게 회의록 즉시 이메일 발송")
-        target_email = st.text_input("수신자 이메일 주소 입력", placeholder="example@femtoscience.co.kr")
-
-        if st.button("✉️ 회의록 이메일 전송", use_container_width=True):
-            if target_email:
-                with st.spinner(" 메일에 엑셀 파일을 첨부하여 발송 중입니다..."):
-                    mail_subject = f"[회의록 공유] {meta_data['안건']}"
-                    mail_body = f"안녕하세요.\n\n{meta_data['일시']}에 진행된 회의의 AI 회의록을 공유해 드립니다.\n자세한 요약본 및 원본 내용은 첨부된 엑셀 파일을 확인해 주세요.\n\n감사합니다."
-
-                    success = send_email_with_excel(target_email, st.session_state.excel_path, mail_subject, mail_body)
-                    if success:
-                        st.success(f" {target_email} 로 메일이 성공적으로 전송되었습니다!")
-            else:
-                st.warning("이메일 주소를 입력해 주세요.")
-
+# ========================================================
+# 📂 [Tab 2] Meeting Archive (로그인 권한별 열람 제한)
+# ========================================================
 with tab2:
     st.subheader("📂 Meeting Archive (외부 전용 과거 이력 보관소)")
-    st.caption("외부 전용 파이어스토어 DB에 백업된 전사 회의 기록 목록을 최신순으로 조회합니다.")
 
-    try:
-        # 외부 전용 데이터베이스(external-meetings)를 바라보도록 조회
-        db = firestore.Client(project=PROJECT_ID, database=EXTERNAL_DB_NAME, client_options=my_options)
-        docs = list(db.collection("meetings").order_by("date", direction=firestore.Query.DESCENDING).stream())
+    if not st.session_state.user_email:
+        st.warning("⚠️ 사이드바에서 구글 로그인을 먼저 진행하셔야 회의록을 열람하실 수 있습니다.")
+    else:
+        st.caption(
+            f"접속자: **{st.session_state.user_name}** ({st.session_state.user_email}) | 열람 권한: **Level {st.session_state.user_level} 이하 전체**")
 
-        if not docs:
-            st.info("아직 데이터베이스에 누적된 회의록 기록이 없습니다. 본문 빌드를 완료해 보세요.")
+        allowed_levels = []
+        if st.session_state.user_level >= 1:
+            allowed_levels.append("Level 1 (Public)")
+        if st.session_state.user_level >= 2:
+            allowed_levels.append("Level 2 (Internal)")
+        if st.session_state.user_level >= 3:
+            allowed_levels.append("Level 3 (Secret)")
 
-        for doc in docs:
-            data = doc.to_dict()
-            doc_id = doc.id
+        try:
+            db = firestore.Client(project=PROJECT_ID, database=EXTERNAL_DB_NAME, client_options=my_options)
 
-            with st.expander(
-                    f"📅 {data.get('date', '날짜 정보 없음')} | 🏢 {data.get('dept', '부서 미지정')} | 📋 {data.get('title', '제목 없음')} ({data.get('security_level', 'Level 1')})"):
-                st.markdown(
-                    f"**🗣️ 회의 주관:** {data.get('host', '-')}   |   **✍️ 작성자:** {data.get('writer', '-')}   |   **👥 참석자:** {data.get('attendees', '-')}")
-                st.markdown("---")
+            docs = list(
+                db.collection("meetings")
+                .where("security_level", "in", allowed_levels)
+                .order_by("date", direction=firestore.Query.DESCENDING)
+                .stream()
+            )
 
-                st.markdown("### 🤖 AI 최종 요약 리포트 본문")
-                st.info(data.get('ai_summary', '(요약 내용 없음)'))
+            if not docs:
+                st.info("열람 가능한 회의록 이력이 없거나 접근 권한 범위를 벗어납니다.")
 
-                c1, c2 = st.columns([1, 4])
-                with c1:
-                    if st.button(f"🗑️ 기록 삭제", key=f"del_{doc_id}", help="클라우드 DB에서 이 회의록을 영구히 지웁니다."):
-                        db.collection("meetings").document(doc_id).delete()
-                        st.toast("선택하신 회의록 이력이 정상적으로 삭제되었습니다.")
-                        time.sleep(0.8)
-                        st.rerun()
-                with c2:
-                    with st.expander("🔍 회의 원본 스크립트(STT) 전문 보기"):
-                        st.write(data.get('transcript', '(인식된 원본 텍스트가 없습니다.)'))
+            for doc in docs:
+                data = doc.to_dict()
+                doc_id = doc.id
 
-    except Exception as e:
-        st.write(f"데이터베이스 조회을 확인 중이거나 대기 상태입니다. ({e})")
+                with st.expander(
+                        f"📅 {data.get('date', '날짜 정보 없음')} | 🏢 {data.get('dept', '부서 미지정')} | 📋 {data.get('title', '제목 없음')} ({data.get('security_level', 'Level 1')})"):
+                    st.markdown(
+                        f"**🗣️ 회의 주관:** {data.get('host', '-')}   |   **✍️ 작성자:** {data.get('writer', '-')}   |   **👥 참석자:** {data.get('attendees', '-')}")
+                    st.markdown("---")
+
+                    st.markdown("### 🤖 AI 최종 요약 리포트 본문")
+                    st.info(data.get('ai_summary', '(요약 내용 없음)'))
+
+                    c1, c2 = st.columns([1, 4])
+                    with c1:
+                        is_author = (data.get('writer_email') == st.session_state.user_email)
+                        if st.session_state.user_level == 3 or is_author:
+                            if st.button(f"🗑️ 기록 삭제", key=f"del_{doc_id}", help="클라우드 DB에서 이 회의록을 영구히 지웁니다."):
+                                db.collection("meetings").document(doc_id).delete()
+                                st.toast("선택하신 회의록 이력이 정상적으로 삭제되었습니다.")
+                                time.sleep(0.8)
+                                st.rerun()
+                    with c2:
+                        with st.expander("🔍 회의 원본 스크립트(STT) 전문 보기"):
+                            st.write(data.get('transcript', '(인식된 원본 텍스트가 없습니다.)'))
+
+        except Exception as e:
+            st.error(f"데이터베이스 조회 오류: {e}")
