@@ -1,0 +1,1 @@
+web: streamlit run Meeting_assistant_external.py --server.port=$PORT --server.address=0.0.0.0

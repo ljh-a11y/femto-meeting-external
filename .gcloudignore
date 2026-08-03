@@ -1,0 +1,10 @@
+.gcloudignore
+.git
+.gitignore
+
+# 내 컴퓨터 가상환경 및 파이참 설정 폴더 제외 (핵심!)
+.venv/
+venv/
+.idea/
+__pycache__/
+*.pyc
