@@ -8,3 +8,4 @@ google-cloud-speech
 google-cloud-firestore
 google-auth
 google-cloud-aiplatform
+google-auth-oauthlib
